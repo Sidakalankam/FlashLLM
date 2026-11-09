@@ -1,9 +1,9 @@
-#!/bin/bash
 
+#!/usr/bin/env bash
 set -euo pipefail
 
 echo "========================================"
-echo "=== vLLM Worker Starting ==============="
+echo "=== FlashLLM Worker Starting ==========="
 echo "========================================"
 
 #
@@ -12,13 +12,20 @@ echo "========================================"
 
 : "${MODEL_NAME:?MODEL_NAME is required}"
 
+if [[ ! "$MODEL_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] ||
+   [[ "$MODEL_NAME" == "." ]] ||
+   [[ "$MODEL_NAME" == ".." ]]; then
+    echo "ERROR: Invalid MODEL_NAME: $MODEL_NAME"
+    exit 1
+fi
+
 #
-# Model source configuration
+# Model configuration
 #
 
 MODEL_SOURCE="${MODEL_SOURCE:-local}"
 MODEL_ROOT="${MODEL_ROOT:-/models}"
-MODEL_DIR="$MODEL_ROOT/$MODEL_NAME"
+MODEL_DIR="${MODEL_ROOT%/}/$MODEL_NAME"
 
 #
 # vLLM configuration
@@ -28,6 +35,7 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 DTYPE="${DTYPE:-auto}"
 QUANTIZATION="${QUANTIZATION:-}"
+VLLM_EXTRA_ARGS_JSON="${VLLM_EXTRA_ARGS_JSON:-[]}"
 
 #
 # Server configuration
@@ -39,158 +47,212 @@ echo ""
 echo "Configuration:"
 echo "  Model:          $MODEL_NAME"
 echo "  Model source:   $MODEL_SOURCE"
-echo "  Model root:     $MODEL_ROOT"
 echo "  Model path:     $MODEL_DIR"
 echo "  Port:           $PORT"
 echo "  Max context:    $MAX_MODEL_LEN"
 echo "  GPU memory:     $GPU_MEMORY_UTILIZATION"
 echo "  Dtype:          $DTYPE"
-
-if [ -n "$QUANTIZATION" ]; then
-    echo "  Quantization:   $QUANTIZATION"
-else
-    echo "  Quantization:   auto-detect"
-fi
-
 echo ""
 
 #
-# Verify persistent model storage exists.
+# Verify model storage exists
 #
 
-if [ ! -d "$MODEL_ROOT" ]; then
-    echo "ERROR: Model storage root '$MODEL_ROOT' does not exist."
+if [[ ! -d "$MODEL_ROOT" ]]; then
+    echo "ERROR: Model storage root does not exist: $MODEL_ROOT"
     exit 1
 fi
 
 #
-# Handle model source.
+# Validate model files
+#
+
+validate_model() {
+    local directory="$1"
+
+    if [[ ! -f "$directory/config.json" ]]; then
+        echo "ERROR: Missing config.json in $directory"
+        return 1
+    fi
+
+    python3 - "$directory" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+model_dir = Path(sys.argv[1])
+index_path = model_dir / "model.safetensors.index.json"
+
+if index_path.exists():
+    with index_path.open("r", encoding="utf-8") as f:
+        index = json.load(f)
+
+    weight_map = index.get("weight_map")
+
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError("Invalid safetensors weight_map")
+
+    expected_files = set(weight_map.values())
+
+    for filename in expected_files:
+        path = model_dir / filename
+
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Missing safetensors shard: {filename}"
+            )
+
+    print(f"Validated {len(expected_files)} safetensors shards.")
+
+else:
+    weights = (
+        list(model_dir.glob("*.safetensors"))
+        + list(model_dir.glob("*.bin"))
+    )
+
+    if not weights:
+        raise FileNotFoundError("No model weight files found")
+
+    print(f"Found {len(weights)} model weight files.")
+PY
+}
+
+#
+# Handle model source
 #
 
 case "$MODEL_SOURCE" in
 
     local)
-        echo "Using local model."
+        echo "Using locally cached model."
 
-        if [ ! -d "$MODEL_DIR" ]; then
-            echo "ERROR: Local model directory does not exist:"
-            echo "  $MODEL_DIR"
+        if [[ ! -d "$MODEL_DIR" ]]; then
+            echo "ERROR: Local model directory not found."
             exit 1
         fi
+
+        validate_model "$MODEL_DIR"
         ;;
 
     s3)
-        : "${MODEL_BUCKET:?MODEL_BUCKET is required when MODEL_SOURCE=s3}"
+        : "${MODEL_BUCKET:?MODEL_BUCKET is required for S3 models}"
 
         MODEL_PREFIX="${MODEL_PREFIX:-models/$MODEL_NAME}"
+        MODEL_PREFIX="${MODEL_PREFIX%/}"
 
-        echo "Synchronizing model from:"
-        echo "  s3://$MODEL_BUCKET/$MODEL_PREFIX"
-        echo ""
+        if [[ ! "$MODEL_BUCKET" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] ||
+           [[ "$MODEL_PREFIX" == /* ]] ||
+           [[ "$MODEL_PREFIX" == *".."* ]] ||
+           [[ -z "$MODEL_PREFIX" ]]; then
+            echo "ERROR: Invalid S3 model location."
+            exit 1
+        fi
 
-        mkdir -p "$MODEL_DIR"
+        CACHE_MARKER="$MODEL_DIR/.flashllm-complete"
 
-        aws s3 sync \
-            "s3://$MODEL_BUCKET/$MODEL_PREFIX/" \
-            "$MODEL_DIR/" \
-            --only-show-errors
+        #
+        # Reuse a completed cache when valid.
+        #
 
-        echo ""
-        echo "S3 synchronization complete."
+        if [[ -f "$CACHE_MARKER" ]]; then
+            echo "Found completed model cache."
+
+            if validate_model "$MODEL_DIR"; then
+                echo "Using cached model."
+            else
+                echo "Cached model validation failed."
+                rm -f "$CACHE_MARKER"
+            fi
+        fi
+
+        #
+        # Download into a staging directory.
+        #
+
+        if [[ ! -f "$CACHE_MARKER" ]]; then
+            echo "Downloading model from S3..."
+            echo "  s3://$MODEL_BUCKET/$MODEL_PREFIX"
+
+            STAGING_DIR=$(mktemp -d \
+                "${MODEL_ROOT%/}/.${MODEL_NAME}.staging.XXXXXX")
+
+            BACKUP_DIR=""
+
+            cleanup() {
+                if [[ -n "${STAGING_DIR:-}" && -d "$STAGING_DIR" ]]; then
+                    rm -rf -- "$STAGING_DIR"
+                fi
+
+                if [[ -n "${BACKUP_DIR:-}" && -d "$BACKUP_DIR" ]]; then
+                    if [[ ! -e "$MODEL_DIR" ]]; then
+                        mv -- "$BACKUP_DIR" "$MODEL_DIR"
+                    fi
+                fi
+            }
+
+            trap cleanup EXIT
+
+            aws s3 sync \
+                "s3://$MODEL_BUCKET/$MODEL_PREFIX/" \
+                "$STAGING_DIR/" \
+                --only-show-errors
+
+            validate_model "$STAGING_DIR"
+
+            #
+            # Preserve the old cache until the new
+            # model has been installed successfully.
+            #
+
+            if [[ -e "$MODEL_DIR" ]]; then
+                BACKUP_DIR=$(mktemp -d \
+                    "${MODEL_ROOT%/}/.${MODEL_NAME}.backup.XXXXXX")
+
+                rmdir "$BACKUP_DIR"
+
+                mv -- "$MODEL_DIR" "$BACKUP_DIR"
+            fi
+
+            if ! mv -- "$STAGING_DIR" "$MODEL_DIR"; then
+                echo "ERROR: Failed to install downloaded model."
+
+                if [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR" ]]; then
+                    mv -- "$BACKUP_DIR" "$MODEL_DIR"
+                    BACKUP_DIR=""
+                fi
+
+                exit 1
+            fi
+
+            STAGING_DIR=""
+
+            touch "$CACHE_MARKER"
+
+            #
+            # Remove the old cache only after the
+            # replacement is marked complete.
+            #
+
+            if [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR" ]]; then
+                rm -rf -- "$BACKUP_DIR"
+                BACKUP_DIR=""
+            fi
+
+            trap - EXIT
+
+            echo "Model downloaded and cached successfully."
+        fi
         ;;
 
     *)
         echo "ERROR: Unsupported MODEL_SOURCE: $MODEL_SOURCE"
-        echo "Supported values:"
-        echo "  local"
-        echo "  s3"
         exit 1
         ;;
 
 esac
 
 #
-# Basic model sanity checks.
-#
-
-if [ ! -f "$MODEL_DIR/config.json" ]; then
-    echo "ERROR: config.json does not exist:"
-    echo "  $MODEL_DIR/config.json"
-    exit 1
-fi
-
-if [ ! -f "$MODEL_DIR/tokenizer_config.json" ]; then
-    echo "WARNING: tokenizer_config.json was not found."
-fi
-
-#
-# Verify sharded safetensors.
-#
-
-SAFETENSORS_INDEX="$MODEL_DIR/model.safetensors.index.json"
-
-if [ -f "$SAFETENSORS_INDEX" ]; then
-    echo "Validating safetensors shards..."
-
-    python3 - "$SAFETENSORS_INDEX" "$MODEL_DIR" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-index_path = Path(sys.argv[1])
-model_dir = Path(sys.argv[2])
-
-with index_path.open("r", encoding="utf-8") as f:
-    index = json.load(f)
-
-weight_map = index.get("weight_map")
-
-if not isinstance(weight_map, dict):
-    print(
-        f"ERROR: {index_path.name} does not contain "
-        "a valid weight_map."
-    )
-    sys.exit(1)
-
-expected_files = sorted(set(weight_map.values()))
-
-missing_files = [
-    filename
-    for filename in expected_files
-    if not (model_dir / filename).is_file()
-]
-
-if missing_files:
-    print("ERROR: Missing safetensors shards:")
-
-    for filename in missing_files:
-        print(f"  {filename}")
-
-    sys.exit(1)
-
-print(
-    f"Validated {len(expected_files)} "
-    "safetensors shard file(s)."
-)
-PY
-fi
-
-#
-# Display model weights.
-#
-
-echo ""
-echo "Model weight files:"
-
-find "$MODEL_DIR" \
-    -maxdepth 1 \
-    -type f \
-    \( -name "*.safetensors" -o -name "*.bin" \) \
-    -printf "  %f\n" \
-    2>/dev/null || true
-
-#
-# Construct vLLM command.
+# Construct vLLM arguments
 #
 
 VLLM_ARGS=(
@@ -203,18 +265,56 @@ VLLM_ARGS=(
     --port "$PORT"
 )
 
+if [[ -n "$QUANTIZATION" ]]; then
+    VLLM_ARGS+=(--quantization "$QUANTIZATION")
+fi
+
 #
-# Optional explicit quantization override.
+# Validate optional vLLM arguments.
+# Must be a JSON array of strings.
 #
 
-if [ -n "$QUANTIZATION" ]; then
-    VLLM_ARGS+=(
-        --quantization "$QUANTIZATION"
-    )
+ARGS_FILE=$(mktemp)
+trap 'rm -f -- "$ARGS_FILE"' EXIT
+
+if ! python3 - "$VLLM_EXTRA_ARGS_JSON" > "$ARGS_FILE" <<'PY'
+import json
+import sys
+
+try:
+    args = json.loads(sys.argv[1])
+
+    if not isinstance(args, list) or not all(
+        isinstance(arg, str) for arg in args
+    ):
+        raise ValueError(
+            "VLLM_EXTRA_ARGS_JSON must be a JSON array of strings"
+        )
+
+    if any("\x00" in arg for arg in args):
+        raise ValueError("Arguments cannot contain null bytes")
+
+    for arg in args:
+        sys.stdout.buffer.write(arg.encode("utf-8") + b"\0")
+
+except (json.JSONDecodeError, ValueError) as exc:
+    print(f"ERROR: Invalid vLLM arguments: {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
+then
+    exit 1
 fi
+
+mapfile -d '' -t EXTRA_ARGS < "$ARGS_FILE"
+rm -f -- "$ARGS_FILE"
+trap - EXIT
+
+VLLM_ARGS+=("${EXTRA_ARGS[@]}")
 
 echo ""
 echo "Starting vLLM..."
+echo "Model: $MODEL_NAME"
+echo "Port:  $PORT"
 echo ""
 
 exec vllm serve "${VLLM_ARGS[@]}"

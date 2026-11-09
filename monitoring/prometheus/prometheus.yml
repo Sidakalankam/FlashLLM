@@ -1,8 +1,0 @@
-global:
-  scrape_interval: 5s
-
-scrape_configs:
-  - job_name: "vllm"
-    static_configs:
-      - targets:
-          - "172.31.70.167:8000"

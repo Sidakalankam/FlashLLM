@@ -1,22 +1,27 @@
+
 FROM vllm/vllm-openai:v0.27.1
 
 USER root
 
-# Install tools needed for AWS CLI installation.
+# Install dependencies for AWS CLI.
 RUN apt-get update && \
-    apt-get install -y curl unzip && \
+    apt-get install -y --no-install-recommends \
+    curl \
+    unzip \
+    ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# Install AWS CLI v2.
-RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" \
-    -o "/tmp/awscliv2.zip" && \
+# Install AWS CLI v2 (Linux AMD64).
+RUN curl -fsSL \
+    "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" \
+    -o /tmp/awscliv2.zip && \
     cd /tmp && \
-    unzip awscliv2.zip && \
+    unzip -q awscliv2.zip && \
     ./aws/install && \
     rm -rf /tmp/aws /tmp/awscliv2.zip
 
-COPY start.sh /app/start.sh
+# Copy the generic FlashLLM startup script.
+COPY --chmod=755 start.sh /app/start.sh
 
-RUN chmod +x /app/start.sh
-
-ENTRYPOINT ["/app/start.sh"]
+# Start the worker using Bash.
+ENTRYPOINT ["/bin/bash", "/app/start.sh"]
